@@ -401,10 +401,10 @@
       <div class="form-group">
         <label>Arquivo PowerPoint</label>
         <div class="dropzone" id="dropzone">
-          <input type="file" id="file-input" accept=".pptx" />
+          <input type="file" id="file-input" accept=".pptx" multiple />
           <div class="dropzone-icon">📊</div>
           <div class="dropzone-text">Arraste e solte ou clique para selecionar</div>
-          <div class="dropzone-sub">Apenas arquivos .pptx • Máx. 150 MB</div>
+          <div class="dropzone-sub">Arquivos .pptx • Máx. 150 MB</div>
           <div class="file-name" id="file-name" style="display:none"></div>
         </div>
       </div>
@@ -440,7 +440,7 @@
       <div class="done-header">
         <div class="done-icon">✅</div>
         <h2>Notas geradas com sucesso!</h2>
-        <p>Sua apresentação está pronta com notas de narrador em cada slide.</p>
+        <p>As apresentações estão prontas com notas de narrador em cada slide.</p>
       </div>
 
       <div class="stats-row">
@@ -458,9 +458,9 @@
         </div>
       </div>
 
-      <button class="btn btn-success" id="btn-download" onclick="downloadFile()">
-        ⬇️ Baixar Apresentação com Notas
-      </button>
+      <div id="download-list" style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px;">
+        <!-- Botões gerados via JS -->
+      </div>
       <button class="btn btn-ghost" onclick="resetApp()">
         ← Processar outra apresentação
       </button>
@@ -472,9 +472,15 @@
   </div>
 
   <script>
-    let currentJobId = null;
     let pollInterval = null;
     let totalSlides = 0;
+    
+    // Novas variáveis para fila
+    let filesQueue = [];
+    let currentFileIndex = 0;
+    let completedJobs = [];
+    let totalProcessedSlides = 0;
+
     const HAS_ENV_KEY = {{ 'true' if has_env_key else 'false' }};
 
     // -----------------------------------------------------------------------
@@ -562,9 +568,13 @@
     fileInput.addEventListener('change', updateFileName);
 
     function updateFileName() {
-      const f = fileInput.files[0];
-      if (f) {
-        fileName.textContent = '📎 ' + f.name;
+      const files = fileInput.files;
+      if (files && files.length > 0) {
+        if (files.length === 1) {
+          fileName.textContent = '📎 ' + files[0].name;
+        } else {
+          fileName.textContent = '📎 ' + files.length + ' arquivos selecionados';
+        }
         fileName.style.display = 'block';
         dropzone.classList.add('has-file');
       }
@@ -588,15 +598,40 @@
     async function startUpload() {
       hideError();
       const apiKey = HAS_ENV_KEY ? '' : (document.getElementById('api-key')?.value?.trim() || '');
-      const model  = document.getElementById('model-select').value;
-      const file   = fileInput.files[0];
+      const files = fileInput.files;
 
       if (!HAS_ENV_KEY && !apiKey) return showError('Informe a API key da NVIDIA.');
-      if (!file) return showError('Selecione um arquivo .pptx.');
+      if (!files || files.length === 0) return showError('Selecione pelo menos um arquivo .pptx.');
 
       const btn = document.getElementById('btn-upload');
       btn.disabled = true;
-      btn.textContent = 'Enviando...';
+      btn.textContent = 'Processando Fila...';
+
+      // Inicializa a fila
+      filesQueue = Array.from(files);
+      currentFileIndex = 0;
+      completedJobs = [];
+      totalProcessedSlides = 0;
+
+      showView('view-processing');
+      await processNextFile();
+    }
+
+    async function processNextFile() {
+      if (currentFileIndex >= filesQueue.length) {
+        // Fila terminou
+        showDoneView();
+        return;
+      }
+
+      const file = filesQueue[currentFileIndex];
+      const apiKey = HAS_ENV_KEY ? '' : (document.getElementById('api-key')?.value?.trim() || '');
+      const model = document.getElementById('model-select').value;
+
+      document.getElementById('proc-filename').textContent = `[${currentFileIndex + 1}/${filesQueue.length}] ${file.name}`;
+      document.getElementById('progress-bar').style.width = '0%';
+      document.getElementById('slides-done').textContent = '0 slides concluídos';
+      document.getElementById('status-msg').textContent = 'Enviando arquivo...';
 
       const form = new FormData();
       if (!HAS_ENV_KEY) form.append('api_key', apiKey);
@@ -604,30 +639,28 @@
       form.append('file', file);
 
       try {
-        const res  = await fetch('/upload', { method: 'POST', body: form });
+        const res = await fetch('/upload', { method: 'POST', body: form });
         const data = await res.json();
 
         if (!res.ok) {
-          showError(data.error || 'Erro ao enviar o arquivo.');
-          btn.disabled = false;
-          btn.textContent = '✨ Gerar Notas com IA';
+          alert(`Erro ao enviar o arquivo ${file.name}: ` + (data.error || 'Desconhecido'));
+          // Pular para o próximo em caso de falha de envio inicial
+          currentFileIndex++;
+          processNextFile();
           return;
         }
 
         currentJobId = data.job_id;
-        totalSlides  = data.total_slides;
+        totalSlides = data.total_slides;
 
         buildSlidesGrid(totalSlides);
         document.getElementById('slides-total').textContent = `de ${totalSlides}`;
-        document.getElementById('proc-filename').textContent = file.name;
-
-        showView('view-processing');
+        
         startPolling();
-
       } catch (err) {
-        showError('Falha de conexão. Tente novamente.');
-        btn.disabled = false;
-        btn.textContent = '✨ Gerar Notas com IA';
+        alert(`Falha de conexão com ${file.name}.`);
+        currentFileIndex++;
+        processNextFile();
       }
     }
 
@@ -658,11 +691,18 @@
 
         if (data.status === 'done') {
           clearInterval(pollInterval);
-          setTimeout(() => showDoneView(data.total_slides), 600);
+          completedJobs.push({
+            jobId: currentJobId,
+            fileName: filesQueue[currentFileIndex].name
+          });
+          totalProcessedSlides += data.total_slides;
+          currentFileIndex++;
+          setTimeout(processNextFile, 600);
         } else if (data.status === 'error') {
           clearInterval(pollInterval);
-          alert('Erro: ' + data.message);
-          resetApp();
+          alert(`Erro no arquivo ${filesQueue[currentFileIndex].name}: ` + data.message);
+          currentFileIndex++;
+          setTimeout(processNextFile, 600);
         }
       } catch (e) {
         // network hiccup, keep trying
@@ -687,19 +727,35 @@
       }
     }
 
-    function showDoneView(slides) {
-      document.getElementById('stat-slides').textContent = slides;
+    function showDoneView() {
+      document.getElementById('stat-slides').textContent = totalProcessedSlides;
+      
+      const list = document.getElementById('download-list');
+      list.innerHTML = '';
+      
+      if (completedJobs.length === 0) {
+        list.innerHTML = '<p style="color: var(--error)">Nenhum arquivo processado com sucesso.</p>';
+      } else {
+        completedJobs.forEach((job, idx) => {
+          const btn = document.createElement('button');
+          btn.className = 'btn btn-success';
+          btn.textContent = `⬇️ Baixar: ${job.fileName}`;
+          btn.onclick = () => window.location.href = `/download/${job.jobId}`;
+          list.appendChild(btn);
+        });
+      }
+      
       showView('view-done');
-    }
-
-    function downloadFile() {
-      if (currentJobId) window.location.href = `/download/${currentJobId}`;
     }
 
     function resetApp() {
       clearInterval(pollInterval);
       currentJobId = null;
       totalSlides  = 0;
+      filesQueue = [];
+      currentFileIndex = 0;
+      completedJobs = [];
+      totalProcessedSlides = 0;
       fileInput.value = '';
       fileName.style.display = 'none';
       dropzone.classList.remove('has-file');

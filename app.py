@@ -7,6 +7,7 @@ import re
 import io
 import zipfile
 import requests
+import time
 from flask import Flask, render_template, request, jsonify, send_file, session, redirect, url_for
 from pptx import Presentation
 from pdf2image import convert_from_path
@@ -307,8 +308,8 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
 
             if is_first:
                 position_instruction = (
-                    "- Este é o PRIMEIRO slide. Faça uma breve saudação de boas-vindas ao início das notas "
-                    "(apenas aqui — não repita boas-vindas em nenhum outro slide)."
+                    "- Este é o PRIMEIRO slide. Inicie o assunto de forma direta ou com uma introdução ao tema. "
+                    "NÃO gere saudações iniciais como 'bom dia', 'boa tarde', 'boa noite', 'olá' ou 'sejam bem-vindos'."
                 )
             elif is_last:
                 position_instruction = (
@@ -378,6 +379,9 @@ Regras OBRIGATÓRIAS:
             notes_slide = slide.notes_slide
             tf = notes_slide.notes_text_frame
             tf.text = notes_text
+            
+            # Respeitar limite de requisições da NVIDIA (40 RPM -> 1 req a cada 1.5s)
+            time.sleep(2)
 
         output_path = os.path.join(job_dir, 'output.pptx')
         prs.save(output_path)
