@@ -453,16 +453,38 @@ def get_models():
         resp.raise_for_status()
         data = resp.json()
 
+        # Variável de ambiente para filtrar modelos específicos (separados por vírgula)
+        allowed_models_env = os.environ.get('MODELOS_PERMITIDOS', '').strip()
+        allowed_models = [m.strip().lower() for m in allowed_models_env.split(',') if m.strip()]
+
         # Retornamos os modelos disponíveis
         vision_models = []
         for m in data.get('data', []):
             model_id = m.get('id', '')
-            # Filtramos para mostrar modelos de linguagem (instruct/vision) para não poluir muito a lista, ou todos
-            if 'instruct' in model_id.lower() or 'vision' in model_id.lower() or 'vlm' in model_id.lower() or 'llama' in model_id.lower():
-                vision_models.append({
-                    'id': model_id,
-                    'label': model_id
-                })
+            model_id_lower = model_id.lower()
+            
+            if allowed_models:
+                # Se o usuário definiu modelos permitidos, respeitar essa lista
+                if any(allowed in model_id_lower for allowed in allowed_models):
+                    vision_models.append({
+                        'id': model_id,
+                        'label': model_id
+                    })
+            else:
+                # Filtramos apenas modelos que comprovadamente suportam visão
+                # (Modelos de texto puros retornariam erro ao receber imagem)
+                is_vision = (
+                    'vision' in model_id_lower or
+                    'vl' in model_id_lower or
+                    'vila' in model_id_lower or
+                    'neva' in model_id_lower or
+                    'pixtral' in model_id_lower
+                )
+                if is_vision:
+                    vision_models.append({
+                        'id': model_id,
+                        'label': model_id
+                    })
         
         # Ordena alfabeticamente
         vision_models = sorted(vision_models, key=lambda x: x['label'])
@@ -470,8 +492,8 @@ def get_models():
         # Se a API não retornou nenhum (fallback para lista conhecida)
         if not vision_models:
             vision_models = [
-                {'id': 'meta/llama-3.3-70b-instruct', 'label': 'Meta Llama 3.3 70B'},
-                {'id': 'nvidia/llama-3.1-nemotron-70b-instruct', 'label': 'Nemotron 70B'},
+                {'id': 'meta/llama-3.2-11b-vision-instruct', 'label': 'Meta Llama 3.2 11B Vision'},
+                {'id': 'meta/llama-3.2-90b-vision-instruct', 'label': 'Meta Llama 3.2 90B Vision'},
             ]
 
         return jsonify({'models': vision_models})
