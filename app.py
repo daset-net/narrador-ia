@@ -24,8 +24,8 @@ jobs = {}
 jobs_lock = threading.Lock()
 
 # --- Env vars ---
-# Suporta 'chave-api' (preferencial) e 'NVIDIA_API_KEY' (legado)
-ENV_API_KEY = (os.environ.get('chave-api', '') or os.environ.get('NVIDIA_API_KEY', '')).strip()
+# Suporta 'chave-api', 'NVIDIA_API_KEY' e 'GROQ_API_KEY' (para manter compatibilidade)
+ENV_API_KEY = (os.environ.get('chave-api', '') or os.environ.get('NVIDIA_API_KEY', '') or os.environ.get('GROQ_API_KEY', '')).strip()
 
 # Suporte a múltiplos usuários via APP_USUARIO_01/APP_SENHA_01 ... APP_USUARIO_99/APP_SENHA_99
 # Também aceita o formato legado APP_USUARIO/APP_SENHA como usuário único
