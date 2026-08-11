@@ -32,6 +32,9 @@ API_BASE_URL = os.environ.get('API_BASE_URL', 'https://api.groq.com/openai/v1').
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'openai/gpt-oss-120b').strip()
 VISION_MODEL = os.environ.get('VISION_MODEL', 'qwen/qwen3.6-27b').strip()
 FALLBACK_MODEL = os.environ.get('FALLBACK_MODEL', 'llama-3.3-70b-versatile').strip()
+# Mínimo de palavras extraídas do slide para PULAR o modelo de visão (economiza custo)
+# Se o slide tem >= VISION_MIN_WORDS palavras extraídas, não precisa chamar visão
+VISION_MIN_WORDS = int(os.environ.get('VISION_MIN_WORDS', '30'))
 
 # Suporte a múltiplos usuários via APP_USUARIO_01/APP_SENHA_01 ... APP_USUARIO_99/APP_SENHA_99
 # Também aceita o formato legado APP_USUARIO/APP_SENHA como usuário único
@@ -322,6 +325,7 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
                             if text:
                                 slide_texts.append(text)
             slide_text_fallback = '\n'.join(slide_texts) if slide_texts else '(slide sem texto visível)'
+            word_count = len(slide_text_fallback.split())
 
             headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -329,46 +333,63 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
             }
 
             # =====================================================================
-            # ESTÁGIO 1 — Modelo de VISÃO lê a imagem e descreve o conteúdo
+            # ESTÁGIO 1 — Modelo de VISÃO (só quando o slide tem pouco texto)
+            # Se o slide já tem texto suficiente, pula a visão para economizar
             # =====================================================================
             slide_description = None
-            try:
-                vision_payload = {
-                    "model": VISION_MODEL,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{image_data}"}
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Descreva detalhadamente TODO o conteúdo visível neste slide de apresentação. "
-                                    "Inclua: título, subtítulos, todos os textos, bullet points, dados de tabelas, "
-                                    "gráficos (descreva os dados), imagens (descreva o que mostram), diagramas e qualquer elemento visual. "
-                                    "IGNORE completamente marcas d'água, logos de rodapé ou watermarks (como NotebookLM, Google). "
-                                    "Retorne apenas a descrição completa do conteúdo em português do Brasil, sem comentários adicionais."
-                                )
-                            }
-                        ]
-                    }],
-                    "max_tokens": 1024,
-                    "temperature": 0.3
-                }
-                resp_vision = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=vision_payload, timeout=60)
-                resp_vision.raise_for_status()
-                slide_description = resp_vision.json()['choices'][0]['message']['content'].strip()
-                slide_description = clean_watermarks(slide_description)
-            except Exception:
-                slide_description = None  # Vai usar o fallback do python-pptx
 
-            # Se a visão falhou, usa o texto extraído via python-pptx
+            if word_count < VISION_MIN_WORDS and VISION_MODEL:
+                # Slide com pouco texto → provavelmente tem gráficos/imagens → usa visão
+                update_job(
+                    job_id,
+                    status='processing',
+                    current_slide=i + 1,
+                    message=f'Slide {i + 1} de {slide_count} — Lendo imagem com IA de visão...'
+                )
+                try:
+                    vision_payload = {
+                        "model": VISION_MODEL,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{image_data}"}
+                                },
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Descreva detalhadamente TODO o conteúdo visível neste slide de apresentação. "
+                                        "Inclua: título, subtítulos, todos os textos, bullet points, dados de tabelas, "
+                                        "gráficos (descreva os dados), imagens (descreva o que mostram), diagramas e qualquer elemento visual. "
+                                        "IGNORE completamente marcas d'água, logos de rodapé ou watermarks (como NotebookLM, Google). "
+                                        "Retorne apenas a descrição completa do conteúdo em português do Brasil, sem comentários adicionais."
+                                    )
+                                }
+                            ]
+                        }],
+                        "max_tokens": 1024,
+                        "temperature": 0.3
+                    }
+                    resp_vision = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=vision_payload, timeout=60)
+                    resp_vision.raise_for_status()
+                    slide_description = resp_vision.json()['choices'][0]['message']['content'].strip()
+                    slide_description = clean_watermarks(slide_description)
+                except Exception:
+                    slide_description = None
+                time.sleep(1)  # Pausa entre estágios
+            else:
+                # Slide com texto suficiente → pula visão, economiza custo
+                update_job(
+                    job_id,
+                    status='processing',
+                    current_slide=i + 1,
+                    message=f'Slide {i + 1} de {slide_count} — Texto extraído, gerando notas...'
+                )
+
+            # Se a visão não foi usada ou falhou, usa o texto extraído via python-pptx
             if not slide_description:
                 slide_description = slide_text_fallback
-
-            time.sleep(1)  # Pausa entre estágios
 
             # =====================================================================
             # ESTÁGIO 2 — Modelo de TEXTO gera as notas do narrador
