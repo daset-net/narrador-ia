@@ -30,6 +30,8 @@ ENV_API_KEY = (os.environ.get('chave-api', '') or os.environ.get('NVIDIA_API_KEY
 
 API_BASE_URL = os.environ.get('API_BASE_URL', 'https://api.groq.com/openai/v1').strip().rstrip('/')
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'openai/gpt-oss-120b').strip()
+VISION_MODEL = os.environ.get('VISION_MODEL', 'qwen/qwen3.6-27b').strip()
+FALLBACK_MODEL = os.environ.get('FALLBACK_MODEL', 'llama-3.3-70b-versatile').strip()
 
 # Suporte a múltiplos usuários via APP_USUARIO_01/APP_SENHA_01 ... APP_USUARIO_99/APP_SENHA_99
 # Também aceita o formato legado APP_USUARIO/APP_SENHA como usuário único
@@ -296,7 +298,7 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
                 job_id,
                 status='processing',
                 current_slide=i + 1,
-                message=f'Gerando notas para o slide {i + 1} de {slide_count}...'
+                message=f'Slide {i + 1} de {slide_count} — Lendo imagem com IA de visão...'
             )
 
             img_path = os.path.join(job_dir, f'slide_{i}.png')
@@ -305,7 +307,7 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
             with open(img_path, 'rb') as f:
                 image_data = base64.b64encode(f.read()).decode()
 
-            # Extrai texto do slide via python-pptx (para modelos sem suporte a visão)
+            # Fallback: extrai texto do slide via python-pptx
             slide_texts = []
             for shape in slide.shapes:
                 if shape.has_text_frame:
@@ -319,8 +321,58 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
                             text = cell.text.strip()
                             if text:
                                 slide_texts.append(text)
-            slide_text_content = '\n'.join(slide_texts) if slide_texts else '(slide sem texto visível)'
+            slide_text_fallback = '\n'.join(slide_texts) if slide_texts else '(slide sem texto visível)'
 
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+
+            # =====================================================================
+            # ESTÁGIO 1 — Modelo de VISÃO lê a imagem e descreve o conteúdo
+            # =====================================================================
+            slide_description = None
+            try:
+                vision_payload = {
+                    "model": VISION_MODEL,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{image_data}"}
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Descreva detalhadamente TODO o conteúdo visível neste slide de apresentação. "
+                                    "Inclua: título, subtítulos, todos os textos, bullet points, dados de tabelas, "
+                                    "gráficos (descreva os dados), imagens (descreva o que mostram), diagramas e qualquer elemento visual. "
+                                    "IGNORE completamente marcas d'água, logos de rodapé ou watermarks (como NotebookLM, Google). "
+                                    "Retorne apenas a descrição completa do conteúdo em português do Brasil, sem comentários adicionais."
+                                )
+                            }
+                        ]
+                    }],
+                    "max_tokens": 1024,
+                    "temperature": 0.3
+                }
+                resp_vision = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=vision_payload, timeout=60)
+                resp_vision.raise_for_status()
+                slide_description = resp_vision.json()['choices'][0]['message']['content'].strip()
+                slide_description = clean_watermarks(slide_description)
+            except Exception:
+                slide_description = None  # Vai usar o fallback do python-pptx
+
+            # Se a visão falhou, usa o texto extraído via python-pptx
+            if not slide_description:
+                slide_description = slide_text_fallback
+
+            time.sleep(1)  # Pausa entre estágios
+
+            # =====================================================================
+            # ESTÁGIO 2 — Modelo de TEXTO gera as notas do narrador
+            # =====================================================================
             # Instrução de posição do slide (primeiro / meio / último)
             is_first = (i == 0)
             is_last  = (i == slide_count - 1)
@@ -343,18 +395,24 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
                     "Vá direto ao conteúdo do slide."
                 )
 
-            # Lê configurações de texto das variáveis de ambiente
             multiplicador   = os.environ.get('MULTIPLICADOR_TEXTO', '2')
             limite_palavras = int(os.environ.get('LIMITE_PALAVRAS', '120'))
             max_tok         = min(int(limite_palavras * 1.8), 1024)
 
-            prompt_text = f"""Você é um especialista em criação de roteiros para apresentações profissionais.
+            update_job(
+                job_id,
+                status='processing',
+                current_slide=i + 1,
+                message=f'Slide {i + 1} de {slide_count} — Gerando notas do narrador...'
+            )
 
-Analise o conteúdo do slide {i + 1} de {slide_count} e crie notas de narrador em português do Brasil.
+            notes_prompt = f"""Você é um especialista em criação de roteiros para apresentações profissionais.
 
-CONTEÚDO DO SLIDE:
+Com base na descrição do conteúdo do slide {i + 1} de {slide_count}, crie notas de narrador em português do Brasil.
+
+DESCRIÇÃO DO CONTEÚDO DO SLIDE:
 \"\"\"
-{slide_text_content}
+{slide_description}
 \"\"\"
 
 Regras OBRIGATÓRIAS:
@@ -364,66 +422,53 @@ Regras OBRIGATÓRIAS:
 - Inclua frases de transição suaves e naturais.
 - Mantenha tom profissional e acessível.
 - NUNCA use saudações temporais (como "bom dia", "boa tarde", "boa noite" ou "olá"). O conteúdo será usado por alunos EAD que poderão assistir em qualquer horário.
-- IGNORE completamente quaisquer marcas d'água, logos, rodapés ou watermarks visíveis no slide (ex: NotebookLM, Google, etc.) — não os mencione de forma alguma.
+- IGNORE completamente quaisquer marcas d'água, logos, rodapés ou watermarks (ex: NotebookLM, Google, etc.) — não os mencione.
 {position_instruction}
 - Retorne SOMENTE o texto corrido das notas, sem títulos, marcadores ou qualquer formatação."""
 
+            notes_text = None
+            # Tenta com o modelo principal (DEFAULT_MODEL)
             try:
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-
-                # Tenta primeiro com imagem (para modelos com suporte a visão)
-                payload = {
+                text_payload = {
                     "model": model,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{image_data}"}
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt_text
-                            }
-                        ]
-                    }],
+                    "messages": [{"role": "user", "content": notes_prompt}],
                     "max_tokens": max_tok,
                     "temperature": 1,
                     "top_p": 0.95
                 }
+                resp_text = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=text_payload, timeout=60)
+                resp_text.raise_for_status()
+                notes_text = resp_text.json()['choices'][0]['message']['content'].strip()
+                notes_text = clean_watermarks(notes_text)
+            except Exception:
+                notes_text = None
 
-                resp_api = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60)
-
-                # Se o modelo não suporta visão (400), tenta modo texto puro
-                if resp_api.status_code == 400:
-                    payload = {
-                        "model": model,
-                        "messages": [{
-                            "role": "user",
-                            "content": prompt_text
-                        }],
+            # Fallback: tenta com o modelo reserva (FALLBACK_MODEL)
+            if not notes_text and FALLBACK_MODEL and FALLBACK_MODEL != model:
+                try:
+                    text_payload = {
+                        "model": FALLBACK_MODEL,
+                        "messages": [{"role": "user", "content": notes_prompt}],
                         "max_tokens": max_tok,
                         "temperature": 1,
                         "top_p": 0.95
                     }
-                    resp_api = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60)
+                    resp_text = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=text_payload, timeout=60)
+                    resp_text.raise_for_status()
+                    notes_text = resp_text.json()['choices'][0]['message']['content'].strip()
+                    notes_text = clean_watermarks(notes_text)
+                except Exception as e:
+                    notes_text = f"[Erro ao gerar notas para este slide: {str(e)}]"
 
-                resp_api.raise_for_status()
-                notes_text = resp_api.json()['choices'][0]['message']['content'].strip()
-                notes_text = clean_watermarks(notes_text)
-
-            except Exception as e:
-                notes_text = f"[Erro ao gerar notas para este slide: {str(e)}]"
+            if not notes_text:
+                notes_text = "[Erro: nenhum modelo conseguiu gerar notas para este slide.]"
 
             # Insert notes into the slide
             notes_slide = slide.notes_slide
             tf = notes_slide.notes_text_frame
             tf.text = notes_text
-            
-            # Respeitar limite de requisições (ajustável se necessário)
+
+            # Pausa entre slides para respeitar rate limits
             time.sleep(2)
 
         output_path = os.path.join(job_dir, 'output.pptx')
