@@ -28,6 +28,9 @@ jobs_lock = threading.Lock()
 # Suporta 'chave-api', 'NVIDIA_API_KEY' e 'GROQ_API_KEY' (para manter compatibilidade)
 ENV_API_KEY = (os.environ.get('chave-api', '') or os.environ.get('NVIDIA_API_KEY', '') or os.environ.get('GROQ_API_KEY', '')).strip()
 
+API_BASE_URL = os.environ.get('API_BASE_URL', 'https://api.groq.com/openai/v1').strip().rstrip('/')
+DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'openai/gpt-oss-120b').strip()
+
 # Suporte a múltiplos usuários via APP_USUARIO_01/APP_SENHA_01 ... APP_USUARIO_99/APP_SENHA_99
 # Também aceita o formato legado APP_USUARIO/APP_SENHA como usuário único
 USERS = {}
@@ -351,6 +354,7 @@ Regras OBRIGATÓRIAS:
 - Explique e desenvolva o conteúdo do slide de forma natural para fala, sem extrapolar muito além do que está mostrado.
 - Inclua frases de transição suaves e naturais.
 - Mantenha tom profissional e acessível.
+- NUNCA use saudações temporais (como "bom dia", "boa tarde", "boa noite" ou "olá"). O conteúdo será usado por alunos EAD que poderão assistir em qualquer horário.
 - IGNORE completamente quaisquer marcas d'água, logos, rodapés ou watermarks visíveis no slide (ex: NotebookLM, Google, etc.) — não os mencione de forma alguma.
 {position_instruction}
 - Retorne SOMENTE o texto corrido das notas, sem títulos, marcadores ou qualquer formatação."""
@@ -367,7 +371,7 @@ Regras OBRIGATÓRIAS:
                     "Content-Type": "application/json"
                 }
                 
-                resp_api = requests.post("https://integrate.api.nvidia.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
+                resp_api = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60)
                 resp_api.raise_for_status()
                 notes_text = resp_api.json()['choices'][0]['message']['content'].strip()
                 notes_text = clean_watermarks(notes_text)
@@ -380,7 +384,7 @@ Regras OBRIGATÓRIAS:
             tf = notes_slide.notes_text_frame
             tf.text = notes_text
             
-            # Respeitar limite de requisições da NVIDIA (40 RPM -> 1 req a cada 1.5s)
+            # Respeitar limite de requisições (ajustável se necessário)
             time.sleep(2)
 
         output_path = os.path.join(job_dir, 'output.pptx')
@@ -437,20 +441,20 @@ def index():
     # Informa ao template se a API key está pré-configurada no ambiente
     has_env_key = bool(ENV_API_KEY)
     auth_enabled = AUTH_ENABLED
-    return render_template('index.html', has_env_key=has_env_key, auth_enabled=auth_enabled)
+    return render_template('index.html', has_env_key=has_env_key, auth_enabled=auth_enabled, default_model=DEFAULT_MODEL)
 
 
 @app.route('/models')
 @login_required
 def get_models():
-    """Busca modelos disponíveis na API da NVIDIA."""
-    api_key = ENV_API_KEY or request.headers.get('X-Nvidia-Key', '').strip()
+    """Busca modelos disponíveis na API do provedor."""
+    api_key = ENV_API_KEY or request.headers.get('X-Api-Key', '').strip()
     if not api_key:
         return jsonify({'error': 'API key não disponível.'}), 400
 
     try:
         resp = requests.get(
-            'https://integrate.api.nvidia.com/v1/models',
+            f'{API_BASE_URL}/models',
             headers={'Authorization': f'Bearer {api_key}'},
             timeout=10
         )
@@ -496,8 +500,7 @@ def get_models():
         # Se a API não retornou nenhum (fallback para lista conhecida)
         if not vision_models:
             vision_models = [
-                {'id': 'meta/llama-3.2-11b-vision-instruct', 'label': 'Meta Llama 3.2 11B Vision'},
-                {'id': 'meta/llama-3.2-90b-vision-instruct', 'label': 'Meta Llama 3.2 90B Vision'},
+                {'id': DEFAULT_MODEL, 'label': DEFAULT_MODEL},
             ]
 
         return jsonify({'models': vision_models})
@@ -511,11 +514,11 @@ def get_models():
 def upload():
     # Usa a API key do ambiente se disponível, senão pega do form
     api_key = ENV_API_KEY or request.form.get('api_key', '').strip()
-    model   = request.form.get('model', 'meta/llama-3.3-70b-instruct').strip()
+    model   = request.form.get('model', DEFAULT_MODEL).strip()
     file    = request.files.get('file')
 
     if not api_key:
-        return jsonify({'error': 'A API key da NVIDIA é obrigatória.'}), 400
+        return jsonify({'error': 'A API key do provedor é obrigatória.'}), 400
     if not file:
         return jsonify({'error': 'Nenhum arquivo enviado.'}), 400
     if not file.filename.lower().endswith('.pptx'):
