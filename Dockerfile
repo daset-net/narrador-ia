@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y \
     poppler-utils \
     fonts-liberation \
     fonts-dejavu \
+    tesseract-ocr \
+    tesseract-ocr-por \
     --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

@@ -13,6 +13,7 @@ from pptx import Presentation
 from pdf2image import convert_from_path
 from functools import wraps
 from PIL import Image, ImageFilter
+import pytesseract
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 150 * 1024 * 1024  # 150MB
@@ -301,7 +302,7 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
                 job_id,
                 status='processing',
                 current_slide=i + 1,
-                message=f'Slide {i + 1} de {slide_count} — Lendo imagem com IA de visão...'
+                message=f'Slide {i + 1} de {slide_count} — Extraindo texto (OCR)...'
             )
 
             img_path = os.path.join(job_dir, f'slide_{i}.png')
@@ -310,43 +311,56 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
             with open(img_path, 'rb') as f:
                 image_data = base64.b64encode(f.read()).decode()
 
-            # Fallback: extrai texto do slide via python-pptx
-            slide_texts = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for paragraph in shape.text_frame.paragraphs:
-                        text = paragraph.text.strip()
-                        if text:
-                            slide_texts.append(text)
-                if shape.has_table:
-                    for row in shape.table.rows:
-                        for cell in row.cells:
-                            text = cell.text.strip()
-                            if text:
-                                slide_texts.append(text)
-            slide_text_fallback = '\n'.join(slide_texts) if slide_texts else '(slide sem texto visível)'
-            word_count = len(slide_text_fallback.split())
-
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-
-            # =====================================================================
-            # ESTÁGIO 1 — Modelo de VISÃO (só quando o slide tem pouco texto)
-            # Se o slide já tem texto suficiente, pula a visão para economizar
-            # =====================================================================
+            # =================================================================
+            # ESTÁGIO 1 — Extração de texto (GRÁTIS)
+            # Prioridade: OCR (Tesseract) > python-pptx > Visão IA (fallback)
+            # =================================================================
             slide_description = None
 
-            if word_count < VISION_MIN_WORDS and VISION_MODEL:
-                # Slide com pouco texto → provavelmente tem gráficos/imagens → usa visão
+            # 1a) Tenta OCR com Tesseract (grátis, lê texto de imagens)
+            try:
+                ocr_image = Image.open(img_path)
+                ocr_text = pytesseract.image_to_string(ocr_image, lang='por').strip()
+                ocr_text = clean_watermarks(ocr_text)
+                # Remove linhas vazias excessivas
+                ocr_text = re.sub(r'\n{3,}', '\n\n', ocr_text).strip()
+                if len(ocr_text.split()) >= 5:  # Mínimo 5 palavras para considerar válido
+                    slide_description = ocr_text
+            except Exception:
+                pass
+
+            # 1b) Se OCR falhou, tenta python-pptx (shapes de texto)
+            if not slide_description:
+                slide_texts = []
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for paragraph in shape.text_frame.paragraphs:
+                            text = paragraph.text.strip()
+                            if text:
+                                slide_texts.append(text)
+                    if shape.has_table:
+                        for row in shape.table.rows:
+                            for cell in row.cells:
+                                text = cell.text.strip()
+                                if text:
+                                    slide_texts.append(text)
+                pptx_text = '\n'.join(slide_texts)
+                if len(pptx_text.split()) >= 5:
+                    slide_description = pptx_text
+
+            # 1c) Último recurso: usa modelo de visão (pago, só se OCR e pptx falharam)
+            if not slide_description and VISION_MODEL:
                 update_job(
                     job_id,
                     status='processing',
                     current_slide=i + 1,
-                    message=f'Slide {i + 1} de {slide_count} — Lendo imagem com IA de visão...'
+                    message=f'Slide {i + 1} de {slide_count} — OCR insuficiente, usando visão IA...'
                 )
                 try:
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json"
+                    }
                     vision_payload = {
                         "model": VISION_MODEL,
                         "messages": [{
@@ -375,21 +389,17 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
                     resp_vision.raise_for_status()
                     slide_description = resp_vision.json()['choices'][0]['message']['content'].strip()
                     slide_description = clean_watermarks(slide_description)
+                    time.sleep(1)
                 except Exception:
-                    slide_description = None
-                time.sleep(1)  # Pausa entre estágios
-            else:
-                # Slide com texto suficiente → pula visão, economiza custo
-                update_job(
-                    job_id,
-                    status='processing',
-                    current_slide=i + 1,
-                    message=f'Slide {i + 1} de {slide_count} — Texto extraído, gerando notas...'
-                )
+                    slide_description = '(não foi possível extrair conteúdo deste slide)'
 
-            # Se a visão não foi usada ou falhou, usa o texto extraído via python-pptx
             if not slide_description:
-                slide_description = slide_text_fallback
+                slide_description = '(slide sem conteúdo identificado)'
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
 
             # =====================================================================
             # ESTÁGIO 2 — Modelo de TEXTO gera as notas do narrador
