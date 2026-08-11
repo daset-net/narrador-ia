@@ -305,6 +305,22 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
             with open(img_path, 'rb') as f:
                 image_data = base64.b64encode(f.read()).decode()
 
+            # Extrai texto do slide via python-pptx (para modelos sem suporte a visão)
+            slide_texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        text = paragraph.text.strip()
+                        if text:
+                            slide_texts.append(text)
+                if shape.has_table:
+                    for row in shape.table.rows:
+                        for cell in row.cells:
+                            text = cell.text.strip()
+                            if text:
+                                slide_texts.append(text)
+            slide_text_content = '\n'.join(slide_texts) if slide_texts else '(slide sem texto visível)'
+
             # Instrução de posição do slide (primeiro / meio / último)
             is_first = (i == 0)
             is_last  = (i == slide_count - 1)
@@ -332,21 +348,14 @@ def process_presentation(job_id, pptx_path, api_key, model, total_slides):
             limite_palavras = int(os.environ.get('LIMITE_PALAVRAS', '120'))
             max_tok         = min(int(limite_palavras * 1.8), 1024)
 
-            try:
-                payload = {
-                    "model": model,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{image_data}"}
-                            },
-                            {
-                                "type": "text",
-                                "text": f"""Você é um especialista em criação de roteiros para apresentações profissionais.
+            prompt_text = f"""Você é um especialista em criação de roteiros para apresentações profissionais.
 
-Analise este slide ({i + 1} de {slide_count}) e crie notas de narrador em português do Brasil.
+Analise o conteúdo do slide {i + 1} de {slide_count} e crie notas de narrador em português do Brasil.
+
+CONTEÚDO DO SLIDE:
+\"\"\"
+{slide_text_content}
+\"\"\"
 
 Regras OBRIGATÓRIAS:
 - Escreva aproximadamente {multiplicador}x o volume de palavras visíveis no próprio slide.
@@ -358,6 +367,26 @@ Regras OBRIGATÓRIAS:
 - IGNORE completamente quaisquer marcas d'água, logos, rodapés ou watermarks visíveis no slide (ex: NotebookLM, Google, etc.) — não os mencione de forma alguma.
 {position_instruction}
 - Retorne SOMENTE o texto corrido das notas, sem títulos, marcadores ou qualquer formatação."""
+
+            try:
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                }
+
+                # Tenta primeiro com imagem (para modelos com suporte a visão)
+                payload = {
+                    "model": model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{image_data}"}
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt_text
                             }
                         ]
                     }],
@@ -365,13 +394,23 @@ Regras OBRIGATÓRIAS:
                     "temperature": 1,
                     "top_p": 0.95
                 }
-                
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-                
+
                 resp_api = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60)
+
+                # Se o modelo não suporta visão (400), tenta modo texto puro
+                if resp_api.status_code == 400:
+                    payload = {
+                        "model": model,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt_text
+                        }],
+                        "max_tokens": max_tok,
+                        "temperature": 1,
+                        "top_p": 0.95
+                    }
+                    resp_api = requests.post(f"{API_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60)
+
                 resp_api.raise_for_status()
                 notes_text = resp_api.json()['choices'][0]['message']['content'].strip()
                 notes_text = clean_watermarks(notes_text)
